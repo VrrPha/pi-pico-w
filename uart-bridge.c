@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 /*
  * Copyright 2021 Álvaro Fernández Rojas <noltari@gmail.com>
+ * Cleanup/modifications Copyright 2023 Andrew J. Kroll <xxxajk at gmail>
+ *
  */
 
 #include <hardware/irq.h>
@@ -18,6 +20,12 @@
 #define LED_PIN 25
 
 #define BUFFER_SIZE 2560
+
+#define UART0_TX 16
+#define UART0_RX 17
+
+#define UART1_TX 4
+#define UART1_RX 5
 
 #define DEF_BIT_RATE 115200
 #define DEF_STOP_BITS 1
@@ -52,18 +60,19 @@ const uart_id_t UART_ID[CFG_TUD_CDC] = {
 		.inst = uart0,
 		.irq = UART0_IRQ,
 		.irq_fn = &uart0_irq_fn,
-		.tx_pin = 16,
-		.rx_pin = 17,
+		.tx_pin = UART0_TX,
+		.rx_pin = UART0_RX,
 	}, {
 		.inst = uart1,
 		.irq = UART1_IRQ,
 		.irq_fn = &uart1_irq_fn,
-		.tx_pin = 4,
-		.rx_pin = 5,
+		.tx_pin = UART1_TX,
+		.rx_pin = UART1_RX,
 	}
 };
 
 uart_data_t UART_DATA[CFG_TUD_CDC];
+volatile bool ready = false;
 
 static inline uint databits_usb2uart(uint8_t data_bits)
 {
@@ -151,21 +160,41 @@ void usb_write_bytes(uint8_t itf)
 {
 	uart_data_t *ud = &UART_DATA[itf];
 
-	if (ud->uart_pos &&
-	    mutex_try_enter(&ud->uart_mtx, NULL)) {
-		uint32_t count;
+	if (ud->uart_pos) {
+		if (mutex_try_enter(&ud->uart_mtx, NULL)) {
+			uint32_t count = tud_cdc_n_write(itf, ud->uart_buffer, ud->uart_pos);
+			// horrible! should use ring buffers!!
+			if (count < ud->uart_pos) {
+				memmove(ud->uart_buffer, &ud->uart_buffer[count], ud->uart_pos - count);
+			}
+			ud->uart_pos -= count;
+			mutex_exit(&ud->uart_mtx);
 
-		count = tud_cdc_n_write(itf, ud->uart_buffer, ud->uart_pos);
-		if (count < ud->uart_pos)
-			memmove(ud->uart_buffer, &ud->uart_buffer[count],
-			       ud->uart_pos - count);
-		ud->uart_pos -= count;
-
-		mutex_exit(&ud->uart_mtx);
-
-		if (count)
-			tud_cdc_n_write_flush(itf);
+			if (count)
+				tud_cdc_n_write_flush(itf);
+		}
 	}
+}
+
+void tud_cdc_send_break_cb(uint8_t itf, uint16_t duration_ms)
+{
+	const uart_id_t *ui = &UART_ID[itf];
+	uart_data_t *ud = &UART_DATA[itf];
+
+	// is mutex for tx even needed??
+	//mutex_enter_blocking(&ud->lc_mtx);
+
+	if (duration_ms == 0xffff) {
+		uart_set_break(ui->inst, true);
+	} else if (duration_ms == 0x0000) {
+		uart_set_break(ui->inst, false);
+	} else {
+		// should be correct for non-compliant stacks?
+		uart_set_break(ui->inst, true);
+		sleep_ms(duration_ms);
+		uart_set_break(ui->inst, false);
+	}
+	//mutex_exit(&ud->lc_mtx);
 }
 
 void usb_cdc_process(uint8_t itf)
@@ -183,17 +212,19 @@ void usb_cdc_process(uint8_t itf)
 void core1_entry(void)
 {
 	tusb_init();
+	ready = true;
 
 	while (1) {
 		int itf;
 		int con = 0;
-
 		tud_task();
 
-		for (itf = 0; itf < CFG_TUD_CDC; itf++) {
-			if (tud_cdc_n_connected(itf)) {
-				con = 1;
-				usb_cdc_process(itf);
+		if (tud_ready()) { // we need to ignore DTR on the CDC side
+			for (itf = 0; itf < CFG_TUD_CDC; itf++) {
+				if (tud_cdc_n_connected(itf)) {
+					con = 1;
+					usb_cdc_process(itf);
+				}
 			}
 		}
 
@@ -209,12 +240,12 @@ static inline void uart_read_bytes(uint8_t itf)
 	if (uart_is_readable(ui->inst)) {
 		mutex_enter_blocking(&ud->uart_mtx);
 
-		while (uart_is_readable(ui->inst) &&
-		       (ud->uart_pos < BUFFER_SIZE)) {
+		if (ud->uart_pos < BUFFER_SIZE) {
 			ud->uart_buffer[ud->uart_pos] = uart_getc(ui->inst);
 			ud->uart_pos++;
+		} else {
+			uart_getc(ui->inst); // drop it on the floor
 		}
-
 		mutex_exit(&ud->uart_mtx);
 	}
 }
@@ -233,22 +264,17 @@ void uart_write_bytes(uint8_t itf)
 {
 	uart_data_t *ud = &UART_DATA[itf];
 
-	if (ud->usb_pos &&
-	    mutex_try_enter(&ud->usb_mtx, NULL)) {
+	if (ud->usb_pos && mutex_try_enter(&ud->usb_mtx, NULL)) {
 		const uart_id_t *ui = &UART_ID[itf];
-		uint32_t count = 0;
 
-		while (uart_is_writable(ui->inst) &&
-		       count < ud->usb_pos) {
-			uart_putc_raw(ui->inst, ud->usb_buffer[count]);
-			count++;
+		// horrible! should use ring buffers!!
+		if (uart_is_writable(ui->inst)) { // && count < ud->usb_pos) {
+			uart_putc_raw(ui->inst, ud->usb_buffer[0]);
+			if (ud->usb_pos > 1) {
+				memmove(ud->usb_buffer, &ud->usb_buffer[1], ud->usb_pos - 1);
+			}
+			ud->usb_pos--;
 		}
-
-		if (count < ud->usb_pos)
-			memmove(ud->usb_buffer, &ud->usb_buffer[count],
-			       ud->usb_pos - count);
-		ud->usb_pos -= count;
-
 		mutex_exit(&ud->usb_mtx);
 	}
 }
@@ -261,6 +287,7 @@ void init_uart_data(uint8_t itf)
 	/* Pinmux */
 	gpio_set_function(ui->tx_pin, GPIO_FUNC_UART);
 	gpio_set_function(ui->rx_pin, GPIO_FUNC_UART);
+	gpio_pull_up(ui->rx_pin); // important missed detail, prevents connection glitches
 
 	/* USB CDC LC */
 	ud->usb_lc.bit_rate = DEF_BIT_RATE;
@@ -290,31 +317,48 @@ void init_uart_data(uint8_t itf)
 			stopbits_usb2uart(ud->usb_lc.stop_bits),
 			parity_usb2uart(ud->usb_lc.parity));
 	uart_set_fifo_enabled(ui->inst, false);
-
+	uart_set_translate_crlf(ui->inst, false);
 	/* UART RX Interrupt */
 	irq_set_exclusive_handler(ui->irq, ui->irq_fn);
-	irq_set_enabled(ui->irq, true);
-	uart_set_irq_enables(ui->inst, true, false);
 }
 
-int main(void)
-{
+void start_uarts() {
+	uint8_t itf;
+	for (itf = 0; itf < CFG_TUD_CDC; itf++) {
+		init_uart_data(itf);
+	}
+
+	// enable ISRs
+	for (itf = 0; itf < CFG_TUD_CDC; itf++) {
+		const uart_id_t *ui = &UART_ID[itf];
+		irq_set_enabled(ui->irq, true);
+		uart_set_irq_enables(ui->inst, true, false);
+	}
+}
+
+int main(void) {
 	int itf;
+
+	multicore_reset_core1();
 
 	usbd_serial_init();
 
-	for (itf = 0; itf < CFG_TUD_CDC; itf++)
-		init_uart_data(itf);
+	start_uarts();
 
 	gpio_init(LED_PIN);
 	gpio_set_dir(LED_PIN, GPIO_OUT);
 
 	multicore_launch_core1(core1_entry);
+	do {
+		sleep_us(1);
+	} while (!ready);
 
 	while (1) {
-		for (itf = 0; itf < CFG_TUD_CDC; itf++) {
-			update_uart_cfg(itf);
-			uart_write_bytes(itf);
+		if (tud_ready()) {
+			for (itf = 0; itf < CFG_TUD_CDC; itf++) {
+				update_uart_cfg(itf);
+				uart_write_bytes(itf);
+			}
 		}
 	}
 
